@@ -1,0 +1,15 @@
+{
+  "name": "mt5-competition-signal-desk",
+  "version": "1.0.0",
+  "description": "Manual signal advisor for an MT5 trading competition — not an EA, not auto-trading",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
