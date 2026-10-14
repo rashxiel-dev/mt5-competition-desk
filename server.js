@@ -64,6 +64,19 @@ const COMMISSION_PER_LOT = parseFloat(process.env.COMMISSION_PER_LOT || "3"); //
 const RISK_PER_TRADE = parseFloat(process.env.RISK_PER_TRADE || "1000"); // 1% of $100k default
 const COMPETITION_START_DATE = process.env.COMPETITION_START_DATE || ""; // "YYYY-MM-DD", optional
 
+// ---- Scale-in rule ("Risk Officer" style) ----
+// If a strategy re-fires the same signal direction while an earlier
+// entry from that same strategy is still open, it is NOT treated as a
+// fresh independent trade. It only adds to the position, and only once
+// that earlier entry has already had its stop moved to breakeven — the
+// ladder can only grow on money that's already safe. The add is sized
+// at a smaller, fixed risk % of account (not the full RISK_PER_TRADE),
+// and each position family can only be added to a capped number of times.
+const SCALE_IN_ENABLED = process.env.SCALE_IN_ENABLED !== "false";
+const SCALE_IN_RISK_PCT = parseFloat(process.env.SCALE_IN_RISK_PCT || "0.5");
+const SCALE_IN_RISK_USD = (ACCOUNT_SIZE * SCALE_IN_RISK_PCT) / 100;
+const SCALE_IN_MAX_ADDS = parseInt(process.env.SCALE_IN_MAX_ADDS || "1", 10);
+
 function localDateKeyFor(date) {
   const local = new Date(date.getTime() + TIMEZONE_OFFSET_HOURS * 3600 * 1000);
   return local.toISOString().slice(0, 10);
@@ -174,6 +187,22 @@ function computeLotSize(slDistance) {
   return Math.min(sized, MAX_LOT_METALS);
 }
 
+// Same shape as computeLotSize, but sized against the smaller scale-in
+// risk budget (SCALE_IN_RISK_USD) instead of the full RISK_PER_TRADE.
+function computeScaleInLotSize(slDistance) {
+  if (!slDistance || slDistance <= 0) return null;
+  const raw = SCALE_IN_RISK_USD / (slDistance * XAU_LOT_USD_PER_POINT);
+  const sized = Math.max(0.01, Math.round(raw * 100) / 100);
+  return Math.min(sized, MAX_LOT_METALS);
+}
+
+// Finds already-open positions opened by the same strategy, in the same
+// direction, so a re-fire can be judged as a potential scale-in add
+// rather than an unrelated fresh trade.
+function findPositionFamily(stratKey, signal) {
+  return state.competition.openPositions.filter((p) => p.stratKey === stratKey && p.signal === signal);
+}
+
 async function applyTradeResult(result, lot, details) {
   const commission = (lot || 0) * COMMISSION_PER_LOT;
   const gross = result === "win" ? RISK_PER_TRADE * (2.5 / 1.5) : result === "breakeven" ? 0 : -RISK_PER_TRADE;
@@ -198,8 +227,9 @@ async function applyTradeResult(result, lot, details) {
     const emoji = result === "win" ? "✅" : result === "breakeven" ? "⚪" : "❌";
     const label = result === "win" ? "WIN" : result === "breakeven" ? "BREAKEVEN" : "LOSS";
     const exitPrice = result === "win" ? details.tp : details.sl;
+    const addTag = details.addNumber ? ` · ADD #${details.addNumber}` : "";
     const msg =
-      `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"})_\n` +
+      `${emoji} *${label}* — ${details.signal} ${SYMBOL} _(${details.strategy || "signal"}${addTag})_\n` +
       `Entry ${details.entryPrice.toFixed(2)} → Exit ~${exitPrice.toFixed(2)} · Lot ${lot?.toFixed(2) || "—"}\n` +
       `P&L after $${commission.toFixed(2)} commission: ${amount >= 0 ? "+" : ""}$${amount.toFixed(2)}\n` +
       `Daily: ${state.competition.dailyPnL >= 0 ? "+" : ""}$${state.competition.dailyPnL.toFixed(2)} / -$${DAILY_LOSS_LIMIT} · ` +
@@ -243,6 +273,7 @@ async function resolveOpenPositions(entryCandles) {
           sl: pos.sl,
           tp: pos.tp,
           strategy: pos.strategy,
+          addNumber: pos.addNumber || 0,
         });
         resolved = true;
         break;
@@ -662,15 +693,22 @@ async function sendTelegram(message) {
   }
 }
 
-function formatSignalMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp) {
+function formatSignalMessage(strategyName, signal, price, rsiVal, time, lot, reason, sl, tp, addNumber = 0) {
   const remainingDaily = DAILY_LOSS_LIMIT + state.competition.dailyPnL;
   const remainingTotal = MAX_LOSS_LIMIT + state.competition.totalPnL;
+  const header = addNumber
+    ? `*${signal} SCALE-IN ADD #${addNumber} — ${SYMBOL}* _(${strategyName})_`
+    : `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_`;
+  const riskLine = addNumber
+    ? `SL ${sl.toFixed(2)} · TP ${tp.toFixed(2)} · Lot ${lot ? lot.toFixed(2) : "—"} (add-on risk ${SCALE_IN_RISK_PCT}% · capped at ${MAX_LOT_METALS})\n` +
+      `_Scale-in: prior entry on this strategy is already at breakeven, so this add only risks fresh money._\n`
+    : `SL ${sl.toFixed(2)} · TP ${tp.toFixed(2)} · Lot ${lot ? lot.toFixed(2) : "—"} (capped at ${MAX_LOT_METALS})\n`;
   return (
-    `*${signal} SIGNAL — ${SYMBOL}* _(${strategyName})_\n` +
+    `${header}\n` +
     `Time: ${time}\n` +
     `Price: ${price.toFixed(2)} · RSI(${RSI_PERIOD}): ${rsiVal.toFixed(1)}\n` +
     `${reason}\n` +
-    `SL ${sl.toFixed(2)} · TP ${tp.toFixed(2)} · Lot ${lot ? lot.toFixed(2) : "—"} (capped at ${MAX_LOT_METALS})\n` +
+    riskLine +
     `Open positions: ${state.competition.openPositions.length}/${MAX_OPEN_POSITIONS} · Trades today: ${state.competition.tradesToday}/${MAX_TRADES_PER_DAY}\n` +
     `Daily buffer left: $${remainingDaily.toFixed(2)} · Overall buffer left: $${remainingTotal.toFixed(2)}\n` +
     `_Manual signal only — place this yourself in MT5. Not an EA, not financial advice._`
@@ -793,25 +831,59 @@ async function checkOnce() {
       continue;
     }
 
+    // Scale-in decision: if this same strategy already has an open
+    // position in the same direction, this re-fire is a candidate add,
+    // not an independent new trade. It only proceeds once an existing
+    // entry in that family is already at breakeven, and only up to
+    // SCALE_IN_MAX_ADDS adds per family.
+    let addNumber = 0;
+    if (SCALE_IN_ENABLED) {
+      const family = findPositionFamily(strat.key, signal);
+      if (family.length > 0) {
+        const addsSoFar = family.filter((p) => p.addNumber > 0).length;
+        const anyAtBreakeven = family.some((p) => p.beMoved);
+        if (addsSoFar >= SCALE_IN_MAX_ADDS) {
+          console.log(`[${new Date().toISOString()}] ${strat.name} ${signal} suppressed — scale-in cap (${SCALE_IN_MAX_ADDS}) reached`);
+          continue;
+        }
+        if (!anyAtBreakeven) {
+          console.log(`[${new Date().toISOString()}] ${strat.name} ${signal} suppressed — waiting for existing entry to reach breakeven before adding`);
+          continue;
+        }
+        addNumber = addsSoFar + 1;
+      }
+    }
+
     state.strategySignals[strat.key] = { lastSignal: signal, lastTime: time, firedAtMs: new Date(nowMs).toISOString() };
     anyFired = true;
 
-    const lot = computeLotSize(Math.abs(price - sl));
+    const lot = addNumber > 0 ? computeScaleInLotSize(Math.abs(price - sl)) : computeLotSize(Math.abs(price - sl));
 
     state.lastSignal = signal;
     state.lastSignalTime = time;
     state.lastSignalPrice = price;
     state.lastSignalStrategy = strat.name;
     state.lastSignalReason = reason;
-    state.history.unshift({ time, signal, price, strategy: strat.name });
+    state.history.unshift({ time, signal, price, strategy: strat.name, addNumber });
     state.history = state.history.slice(0, 30);
 
-    const msg = formatSignalMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp);
+    const msg = formatSignalMessage(strat.name, signal, price, rsiArr[i], time, lot, reason, sl, tp, addNumber);
     await sendTelegram(msg);
     state.competition.tradesToday += 1;
-    state.competition.openPositions.push({ signal, entryPrice: price, sl, tp, entryTime: time, strategy: strat.name, lot, beMoved: false });
+    state.competition.openPositions.push({
+      signal,
+      entryPrice: price,
+      sl,
+      tp,
+      entryTime: time,
+      strategy: strat.name,
+      stratKey: strat.key,
+      lot,
+      beMoved: false,
+      addNumber,
+    });
 
-    console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal} @ ${price}`);
+    console.log(`[${new Date().toISOString()}] Sent ${strat.name} ${signal}${addNumber ? ` (ADD #${addNumber})` : ""} @ ${price}`);
   }
 
   if (!anyFired) console.log(`[${new Date().toISOString()}] No new signal from any strategy`);
@@ -888,6 +960,7 @@ app.post("/api/close-position", async (req, res) => {
     sl: pos.sl,
     tp: pos.tp,
     strategy: pos.strategy,
+    addNumber: pos.addNumber || 0,
   });
   state.competition.openPositions.splice(index, 1);
   res.json({ ok: true, competition: state.competition });
