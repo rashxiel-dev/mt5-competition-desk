@@ -41,6 +41,7 @@ Every competition rule is an environment variable in `env.example.txt` — if th
 
 - **Daily / total P&L** — percentage-based ($100k account → $5,000 daily cap, $10,000 total cap by default), auto-halts new signals once breached
 - **Up to 5 open positions** — each tracked and auto-resolved independently against its own SL/TP, with breakeven-at-20-pips protection
+- **Scale-in adds** — if a strategy fires the same direction again while an earlier entry from it is still open, it's only added to the position once that earlier entry is already at breakeven. The add is sized at a smaller fixed risk (0.5% of account by default, vs. the full 1% on the original entry), and each position family is capped at 1 add by default. Telegram messages for an add are labeled `SCALE-IN ADD #1` so they're easy to tell apart from a fresh entry. Tune with `SCALE_IN_ENABLED`, `SCALE_IN_RISK_PCT`, `SCALE_IN_MAX_ADDS`.
 - **Trade count** — capped at 50/day per the rules
 - **Trading days** — counts distinct days you've logged at least one trade, toward the 5-day minimum
 - **Commission** — $3/lot deducted from every resolved trade's P&L
